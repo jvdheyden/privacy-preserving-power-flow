@@ -1,0 +1,219 @@
+from Compiler.util import if_else
+from data.simbench import *
+from lib import *
+
+# optimizations
+program.use_edabit(True)
+
+# when using semi-honest dishonest majority protocols:
+# program.use_trunc_pr = True
+# when using a ring-based protocol:
+# program.use_split(2) 
+# set precision
+"""
+Generally, 2*k must be at most the integer length 
+for rings and at most m-s-1 for computation modulo
+an m-bit prime and statistical security s (default 40).
+"""
+sfix.set_precision(32,64)
+cfix.set_precision(32,64)
+print_float_precision(16)
+
+def evalJ_forLU(x, iKreal_conj, iKimag_conj,n, spvecG, 
+    rowG, fromtoG, nG, spvecB):
+    # Parse real and imaginary parts of node voltages without slack
+    uKreal = sint.Array(n - 1)
+    uKimag = sint.Array(n - 1)
+    uKreal.assign(x[0:n-1])
+    uKimag.assign(x[n-1:])
+    # assuming same sparsity pattern of G,B
+    H1 = sfix.Matrix(n-1,n-1)
+    H1.assign_all(0)
+    H2 = sfix.Matrix(n-1,n-1)
+    H2.assign_all(0)
+    max_posG = max([y-x for x, y in fromtoG_data]) + 1
+
+    rows = []
+    for i in range(nG):
+        posG = fromtoG[i][1] - fromtoG[i][0]
+        row = []
+        for j in range(posG + 1):
+            k = j + fromtoG[i][0] - 1
+            row.append(rowG[k] - 1)
+        rows.append(row)
+    
+    for i in range(nG):
+        posG = fromtoG[i][1] + 1 - fromtoG[i][0]
+        for j in range(posG):
+            k = j + fromtoG[i][0] - 1
+            H1[rows[i][j]][i] = uKreal[rows[i][j]]*spvecG[k] + \
+                uKimag[rows[i][j]]*spvecB[k]
+            H2[rows[i][j]][i] = -1*uKreal[rows[i][j]]*spvecB[k] + \
+                uKimag[rows[i][j]]*spvecG[k]
+
+    # Construct Jacobian
+    # Wolter, eq. (4.37), (4.39) without factor "3"
+    J = sfix.Matrix(2*(n-1),2*(n-1))
+    J.assign_all(0)
+
+    # J11
+    for i in range(n-1):
+        J[i][i] += iKreal_conj[i+1] # ignore slack node
+        for j in range(n-1):
+            J[i][j] += H1[i][j]
+    # J21
+    for i in range(n-1,2*(n-1)):
+        J[i][i - (n - 1)] += iKimag_conj[i - (n - 1) + 1] # ignore slack node
+        for j in range(n-1):
+            J[i][j] += H2[i - (n - 1)][j]
+    # J12
+    for i in range(n-1):
+        J[i][i + n -1] -= iKimag_conj[i+1] # ignore slack node
+        for j in range(n-1,2*(n-1)):
+            J[i][j] += H2[i][j - (n - 1)]
+
+    # J22
+    for i in range(n-1,2 * (n-1)):
+        J[i][i] += iKreal_conj[i - (n -1) + 1] # ignore slack node
+        for j in range(n-1,2*(n-1)):
+            J[i][j] += -1 * H1[i - (n-1)][j - (n-1)]
+    return J
+
+def LUdecomposition(A,n):
+    # LU decomposition of Matrix A using Dolittle's algorithm
+    # sparsity of A not worth to be exploited with secret sharing since
+    # A only occurs in sums
+    U = sfix.Matrix(n,n)
+    U.assign_all(0)
+    L = sfix.Matrix(n,n)
+    L.assign_all(0)
+    x = sfix(0)
+
+    for i in range(n):
+        L[i][i] = sfix(1)
+
+    # we can use python for-loops
+    for i in range(n):
+        for j in range(i,n):
+            x=sfix(0)
+            for k in range(i):
+                x +=(L[i][k] * U[k][j])
+            U[i][j] = A[i][j] - x
+            x=sfix(0)
+            for k in range(i):
+                x +=(L[j][k] * U[k][i])
+            L[j][i] = (A[j][i] - x)/U[i][i]
+    return (L,U)
+
+def LUsolve(L,U,b,n):
+    # solves linear equation system LUx=b by solving Ly=b and Ux=y
+    y = sfix.Array(n)
+    y.assign_all(0)
+    tmp = sfix(0)
+
+    for i in range(n):
+        tmp = b[i]
+        for j in range(i):
+            tmp -= L[i][j] * y[j]
+        y[i] = tmp / L[i][i]
+
+    x = sfix.Array(n)
+    x.assign_all(0)
+
+    for i in range(n-1,-1,-1):
+        tmp = y[i]
+        for j in range(i+1,n):
+            tmp -= U[i][j] * x[j]
+        x[i] = tmp / U[i][i]
+
+    return x
+
+def main():
+    max_iter = cint(10)  # public
+
+    tol_iter = cfix(10**-6)  # public
+
+    dim_spvec = len(spvecG_data) #public
+    dim_spG = len(spG_data) #public
+    nG = num_nodes - 1  # public 
+    n = nG * 2  # public 
+    
+
+    slack_voltage = cfix(230)  # public
+
+    x = sfix.Array((num_nodes-1) * 2)
+
+    @for_range(0, num_nodes-1)
+    def _(i):
+        x[i] = sfix(207) # starting guess
+
+    @for_range(num_nodes-1, (num_nodes-1) * 2)
+    def _(i):
+        x[i] = sfix(0)
+
+    spG = cfix.Array(dim_spG)
+    spG.assign(spG_data)
+
+    ijG = cint.Array(dim_spG)  # public
+    ijG.assign(ijG_data)
+
+    spB = cfix.Array(dim_spG)
+    spB.assign(spB_data)
+
+    ijB = cint.Array(dim_spG)  # public
+    ijB.assign(ijB_data)
+
+    pK = sfix.Array(num_nodes-1)
+    pK.assign(pK_data)
+
+    qK = sfix.Array(num_nodes-1)
+    qK.assign(qK_data)
+
+    rowG = cint.Array(dim_spvec)  # public
+    rowG.assign(rowG_data)
+
+    spvecG = sfix.Array(dim_spvec)
+    spvecG.assign(spvecG_data)
+
+    spvecB = sfix.Array(dim_spvec)
+    spvecB.assign(spvecB_data)
+
+    J = sfix.Matrix(2*(num_nodes-1), 2*(num_nodes-1))
+    alpha_ = MemValue(sfix(1))
+    
+    num_iterations = MemValue(0)
+
+    @for_range(max_iter)
+    def _(i):
+        (F, iKreal_conj, iKimag_conj) = evalF(x, spG, ijG, spB, ijB, pK, 
+                        qK, num_nodes, slack_voltage)
+        F_check = sfix.Array(n)
+        F_check.assign(F)
+        F_check[:] *= 10**-3
+        F_m = sfix.Matrix(n, 1)
+        F_m.assign(F_check)
+        b = if_else(F_m.transpose().dot(F_check)[0] < tol_iter, 1, 0)
+        @if_(b.reveal())
+        def _():
+            break_loop()
+        F_alpha = sfix.Array(n)
+        F_alpha.assign(F)
+
+        J = evalJ_forLU(x,iKreal_conj,iKimag_conj,num_nodes,
+                spvecG,rowG,fromtoG_data,nG,spvecB)
+        (L,U) = LUdecomposition(J,n)
+
+        dx = LUsolve(L,U,F,n)
+        dx[:] *= -1
+        alpha_.write(compute_alpha(x, dx, F_alpha, spG, ijG, spB, ijB, pK, qK,
+                num_nodes,slack_voltage))
+        dx_alpha = sfix.Array(n)
+        dx_alpha.assign(dx)
+        dx_alpha[:] *= alpha_
+        x[:] += dx_alpha[:]
+        num_iterations.write(num_iterations + 1)
+
+    print_ln('x=%s',x.reveal())
+    print_ln('converged after %s iterations',num_iterations)
+
+main()

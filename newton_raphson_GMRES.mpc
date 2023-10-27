@@ -1,0 +1,338 @@
+from data.simbench import *
+from lib import *
+from Compiler.util import if_else
+from Compiler import library
+from Compiler import mpc_math
+
+# optimizations
+program.use_edabit(True)
+
+# when using semi-honest dishonest majority protocols with not more than 2 parties:
+# program.use_trunc_pr = True
+# when using a ring-based protocol:
+# program.use_split(2) 
+# set precision
+"""
+Generally, 2*k must be at most the integer length 
+for rings and at most m-s-1 for computation modulo
+an m-bit prime and statistical security s (default 40).
+"""
+sfix.set_precision(32,64)
+cfix.set_precision(32,64)
+print_float_precision(16)
+
+
+def evalJ_forGMRES(x, iKreal_conj, iKimag_conj, n, spvecG,
+                rowG, fromtoG, nG, spvecB, diagpos):
+    # Parse real and imaginary parts of node voltages without slack
+    uKreal = sfix.Array(n - 1)
+    uKimag = sfix.Array(n - 1)
+    uKreal.assign(x[0:n-1])
+    uKimag.assign(x[n-1:])
+    H1 = sfix.Array(len(spvecG_data))
+    H2 = sfix.Array(len(spvecG_data))
+    max_posG = max([y-x for x, y in fromtoG_data]) + 1
+
+    rows = []
+    
+    for i in range(nG):
+        posG = fromtoG[i][1] - fromtoG[i][0]
+        row = []
+        for j in range(posG + 1):
+            k = j + fromtoG[i][0] - 1
+            row.append(rowG[k] - 1)
+        rows.append(row)
+
+    for i in range(nG):
+        # changes due to index arithmetic
+        posG = fromtoG[i][1] + 1 - fromtoG[i][0]
+        for j in range(posG):
+            k = j + fromtoG[i][0] - 1
+            H1[k] = uKreal[rows[i][j]]*spvecG[k] + \
+                uKimag[rows[i][j]]*spvecB[k]
+            H2[k] = -1*uKreal[rows[i][j]]*spvecB[k] + \
+                uKimag[rows[i][j]]*spvecG[k]
+    J11 = sfix.Array(len(spvecG_data))
+    J12 = sfix.Array(len(spvecG_data))
+    J21 = sfix.Array(len(spvecG_data))
+    J22 = sfix.Array(len(spvecG_data))
+
+    J11.assign(H1)
+    J12.assign(H2)
+    J21.assign(H2)
+    J22.assign( -1 * H1[:])
+
+    for i in range(len(diagpos)):
+        J11[diagpos[i]-1] += iKreal_conj[i+1]
+        J12[diagpos[i]-1] -= iKimag_conj[i+1]
+        J21[diagpos[i]-1] += iKimag_conj[i+1]
+        J22[diagpos[i]-1] += iKreal_conj[i+1]
+    return (J11,J12,J21,J22)
+
+def evalAb(P, F, J11, J12, J21, J22, rowG, fromtoG, n, n2):
+    F_m = sfix.Matrix(n,1)
+    F_m.assign(F)
+    b = sfix.Matrix(n,1)
+    b.assign(P.dot(F_m))
+
+    A = sfix.Matrix(n,n)
+    A.assign_all(0) # otherwise MP-SPDZ reuses old values of A
+
+    max_posG = max([y-x for x, y in fromtoG_data]) + 1
+
+
+    cols = []
+
+    for i in range(n2):
+        posG = fromtoG[i][1] - fromtoG[i][0]
+        col = []
+        for j in range(posG + 1):
+            k = j + fromtoG[i][0] - 1
+            col.append(rowG[k] - 1)
+        cols.append(col)
+
+    for i in range(n):
+        for j in range(n2):
+            posG = fromtoG[j][1] - fromtoG[j][0]
+            #@for_range(posG+1)
+            #def _(k):
+            for k in range(posG+1):
+                l = k + fromtoG[j][0] - 1
+                A[i][j] += P[i][cols[j][k]] * J11[l] + P[i][cols[j][k] + n2] * J21[l]
+            
+    for i in range(n):
+        for j in range(n2):
+            posG = fromtoG[j][1] - fromtoG[j][0]
+            for k in range(posG+1):
+                l = k + fromtoG[j][0] - 1
+                A[i][j + n2] += P[i][cols[j][k]] * J12[l] + \
+                    P[i][cols[j][k] + n2] * J22[l]
+    
+    return (A,b)
+
+def GMRESsolve(A,b,x0,n,tol,maxiter):
+    num_iterations = MemValue(0)
+    V = sfix.Matrix(n, maxiter + 1)  # Arnoldi (orthonormal) basis vectors
+    V.assign_all(0)
+    H = sfix.Matrix(maxiter + 1,maxiter + 1) # Hessenberg Matrix
+    H.assign_all(0)
+    c = sfix.Array(maxiter+1)  # "cosine" terms of the Givens rotation matrices
+    c.assign_all(0)
+    s = sfix.Array(maxiter+1)  # "sine" terms of the Givnes rotation matrices
+    s.assign_all(0)
+    x = sfix.Array(n)
+    x.assign_all(0)
+    beta_vec = sfix.Array(maxiter+1)
+    beta_vec.assign_all(0)
+    x0_m = sfix.Matrix(n,1)
+    x0_m.assign(x0)
+    r0 = sfix.Matrix(n, 1)
+    r0.assign_all(0)
+    r_1 = sfix.Matrix(n, 1)
+    r_1.assign_all(0)
+    r0.assign(b[:] - A.dot(x0)[:])
+    tmp1 = r0.transpose().dot(r0)[0][0]
+    b = if_else(tmp1 * 10**9 < tol,1,0)
+
+    @if_(b.reveal())
+    def _():
+        return x0
+    
+    tmp2 = 1/mpc_math.sqrt(tmp1)
+    beta = tmp1 * tmp2
+    r_1[:] = r0[:] * tmp2
+    for i in range(n):
+        V[i][0] = r_1[i][0]
+
+    beta_vec[0] = beta
+
+    @for_range_opt(maxiter)
+    def _(j):
+        # Arnoldi iteration / orthogonalization
+        w = sfix.Matrix(n,1)
+        w.assign_all(0)
+        wj = sfix.Matrix(n, 1)
+        wj.assign_all(0)
+        for i in range(n):
+            w[i][0] = V[i][j]
+        wj = A.dot(w)
+        @for_range_opt(j+1)
+        def _(i):
+            V_i = sfix.Matrix(n,1)
+            V_i.assign_all(0)
+            for k in range(n):
+                V_i[k][0] = V[k][i]
+            H[i][j] = wj.transpose().dot(V_i)[0][0] 
+            for k in range(n):
+                wj[k][0] -= (V_i[k][0] * H[i][j])
+        wjwj=wj.transpose().dot(wj)[0][0] 
+        norm_wj = 1/mpc_math.sqrt(wjwj)
+        H[j+1][j] = norm_wj * wjwj
+        # Givens rotations
+        @for_range_opt(j)
+        def _(i):
+            tmp = c[i] * H[i][j] + s[i] * H[i+1][j]
+            H[i+1][j] = -s[i] * H[i][j] + c[i] * H[i+1][j]
+            H[i][j] = tmp
+
+        # compute coefficients of the next rotation matrix
+        tmp = H[j][j]**2 + H[j+1][j]**2
+        den = 1/mpc_math.sqrt(tmp)
+        c[j] = H[j][j] * den
+        s[j] = H[j+1][j] * den
+        # eliminate subdiagonal element in current column
+        H[j][j] = c[j] * H[j][j] + s[j] * H[j+1][j]
+        H[j+1][j] = 0
+
+        # update residual
+        dummy = -1 * s[j] * beta_vec[j]
+        beta_vec[j] *= c[j]
+        res_norm = 10**9 * dummy**2
+        beta_vec[j+1] = dummy
+        
+        b = if_else(res_norm <= tol,1,0)
+
+        @if_(b.reveal())
+        def _():
+            num_iterations.write(num_iterations + 1)
+            break_loop()
+        
+        for i in range(n):
+            wj[i][0] *= norm_wj
+        for i in range(n):
+            V[i][j+1] = wj[i][0]
+                
+        num_iterations.write(num_iterations + 1)
+    #  Compute LS solution via back substitution, i.e. solve H * y = beta_vec
+    j = num_iterations 
+    y = sfix.Array(maxiter+1)
+    y.assign_all(0)
+    y_m = sfix.Matrix(maxiter+1,1)
+    y_m.assign_all(0)
+    H_m = sfix.Matrix(maxiter+1,1)
+    H_m.assign_all(0)
+    @for_range(j,stop=-1,step=-1)
+    def _(k):
+        @if_e(k >= j)
+        def _():
+            y[k] = beta_vec[k]/H[k][k]
+        @else_
+        def _(): 
+            y_m.assign_all(0)
+            H_m.assign_all(0)
+            @for_range(k+1,j)
+            def _(l):
+                y_m[l][0] = y[l]
+                H_m[l][0] = H[k][l]
+            y[k] = (beta_vec[k] - H_m.transpose().dot(y_m)[0][0])/H[k][k]
+    
+    y_m.assign_all(0)
+    y_m.assign(y)
+    x[:] += x0[:]
+    x[:] += V.dot(y_m)[:]
+    return x
+ 
+
+def main():
+    max_iter = cint(10)  # public
+    tol_iter = cfix(10**-6)  # public
+    gmres_tol = cfix(10**-9)  # public
+    gmres_maxiter = 30  # public
+
+    # num_nodes = 44  # public, PEAK: 16, simbench: 44
+    dim_spvec = len(spvecG_data)  # public
+    dim_spG = len(spG_data)  # public
+    nG = num_nodes - 1  # public
+    n2 = nG # public
+    n = nG * 2  # public
+
+    dx0 = sfix.Array(n)  # public
+    dx0.assign_all(0)
+
+    slack_voltage = cfix(230)  # public
+
+    x = sfix.Array((num_nodes-1) * 2)
+
+    for i in range(num_nodes-1):
+        x[i] = sfix(230)  # starting guess
+
+    for i in range(num_nodes-1,num_nodes-1 * 2):
+        x[i] = sfix(0)
+
+    spG = cfix.Array(dim_spG) # public
+    spG.assign(spG_data)
+
+    ijG = cint.Array(dim_spG)  # public
+    ijG.assign(ijG_data)
+
+    spB = cfix.Array(dim_spG) # public
+    spB.assign(spB_data)
+
+    ijB = cint.Array(dim_spG)  # public
+    ijB.assign(ijB_data)
+
+    pK = sfix.Array(num_nodes-1)
+    pK.assign(pK_data)
+
+    qK = sfix.Array(num_nodes-1)
+    qK.assign(qK_data)
+
+    rowG = cint.Array(dim_spvec)  # public
+    rowG.assign(rowG_data)
+
+    spvecG = sfix.Array(dim_spvec)
+    spvecG.assign(spvecG_data)
+
+    spvecB = sfix.Array(dim_spvec)
+    spvecB.assign(spvecB_data)
+
+    J = sfix.Matrix(2*(num_nodes-1), 2*(num_nodes-1))
+
+    diagpos = diagpos_data
+
+    P = sfix.Matrix(n,n) 
+    for i in range(n):
+        for j in range(n):
+            P[i][j] = P_data[i][j]
+
+    alpha_ = MemValue(sfix(1))
+    
+    num_iterations = MemValue(0)
+
+    @for_range(max_iter)
+    def _(i):
+        (F, iKreal_conj, iKimag_conj) = evalF(x, spG, ijG, spB, 
+                            ijB,pK, qK, num_nodes, slack_voltage)
+        F_check = sfix.Array(n)
+        F_check.assign(F)
+        F_check[:] *= 10**-3
+        F_m = sfix.Matrix(n, 1)
+        F_m.assign(F_check)
+        b = if_else(F_m.transpose().dot(F_check)[0] < tol_iter, 1, 0)
+        @if_(b.reveal())
+        def _():
+            break_loop()
+        F_alpha = sfix.Array(n)
+        F_alpha.assign(F)
+
+        (J11, J12, J21, J22) = evalJ_forGMRES(x, iKreal_conj,
+                            iKimag_conj, num_nodes, spvecG_data, rowG, 
+                            fromtoG_data, nG, spvecB_data, diagpos)
+
+        (A, b) = evalAb(P, F, J11, J12, J21, J22, rowG, fromtoG_data, n, n2)
+
+        dx = GMRESsolve(A, b, dx0, n, gmres_tol, gmres_maxiter)
+        dx[:] *= -1
+        alpha_.write(compute_alpha(x, dx, F_alpha, spG, ijG, spB, ijB, pK, qK,
+                        num_nodes,slack_voltage))
+        dx_alpha = sfix.Array(n)
+        dx_alpha.assign(dx)
+        dx_alpha[:] *= alpha_
+        x[:] += dx_alpha[:]
+        num_iterations.write(num_iterations + 1)
+
+    print_ln('converged after %s iterations',num_iterations)
+    print_ln('x=%s',x.reveal())
+
+
+main()
